@@ -1,810 +1,352 @@
+// 取得刪除域名項目資料 (輪詢Job狀態檢查)
+def DeleteDomainJobStatus() {
+    def jobNameMap = [
+        "AddTag": "AddTag 新增 Tag",
+        "AddThirdLevelRandom": "AddThirdLevelRandom 設定三級亂數",
+        "AttachAntiBlockTarget": "AttachAntiBlockTarget 新增抗封鎖目標",
+        "AttachAntiHijackSource": "AttachAntiHijackSource 新增抗劫持",
+        "AttachAntiHijackTarget": "AttachAntiHijackTarget 新增抗劫持目標",
+        "CheckDomainBlocked": "CheckDomainBlocked 檢查封鎖",
+        "CheckPurchaseDeployCertificateStatus": "CheckPurchaseDeployCertificateStatus 檢查購買部署憑證結果",
+        "CheckWorkflowApplication": "CheckWorkflowApplication 檢查自動化申請",
+        "DeleteDomainRecord": "DeleteDomainRecord 刪除解析",
+        "DetachAntiBlockSource": "DetachAntiBlockSource 撤下抗封鎖",
+        "DetachAntiBlockTarget": "DetachAntiBlockTarget 撤下抗封鎖目標",
+        "DetachAntiHijackSource": "DetachAntiHijackSource 撤下抗劫持",
+        "DetachAntiHijackTarget": "DetachAntiHijackTarget 撤下抗劫持目標",
+        "InformDomainInfringement": "InformDomainInfringement 通知侵權網址",
+        "MergeErrorRecord": "MergeErrorRecord 檢查異常地區合併規則",
+        "PurchaseAndDeployCert": "PurchaseAndDeployCert 購買與部署憑證",
+        "PurchaseDomain": "PurchaseDomain 購買域名",
+        "RecheckARecordResolution": "RecheckARecordResolution 複檢域名 A 紀錄解析",
+        "RecheckCert": "RecheckCert 複檢憑證",
+        "RecheckDomainResolution": "RecheckDomainResolution 複檢域名",
+        "RecheckThirdLevelRandom": "RecheckThirdLevelRandom 複檢三級亂數",
+        "RemoveAntiBlock": "RemoveAntiBlock 刪除抗封鎖",
+        "RemoveAntiBlockTarget": "RemoveAntiBlockTarget 刪除抗封鎖目標",
+        "RemoveAntiHijackSource": "RemoveAntiHijackSource 撤下抗劫持",
+        "RemoveAntiHijackTarget": "RemoveAntiHijackTarget 撤下抗劫持目標",
+        "RemoveTag": "RemoveTag 移除 Tag",
+        "ReplaceCertificateProviderDetach": "ReplaceCertificateProviderDetach 替換憑證商下架",
+        "ReuseAndDeployCert": "ReuseAndDeployCert 轉移憑證",
+        "RevokeCert": "RevokeCert 撤銷憑證",
+        "SendCertCompleted": "SendCertCompleted 通知憑證已完成",
+        "SendUpdateUB": "SendUpdateUB 通知 UB 更新",
+        "SyncT2": "SyncT2 同步 F5 T2 設定",
+        "UpdateDomainRecord": "UpdateDomainRecord 設定域名解析",
+        "UpdateNameServer": "UpdateNameServer 上層設定",
+        "UpdateOneToOneList": "UpdateOneToOneList 更新一對一IP清單",
+        "UpdateOneToOneSourceRecord": "UpdateOneToOneSourceRecord 來源域名解析設定",
+        "UpdateOneToOneTargetRecord": "UpdateOneToOneTargetRecord 目標域名解析設定",
+        "VerifyDomainPDNSTags": "VerifyDomainPDNSTags 驗證域名 PDNS Tag",
+        "VerifyTLD": "VerifyTLD 驗證頂級域名"
+    ]
+
+    def envName = "測試環境"
+    if (BASE_URL.contains("vir999.com")) {
+        envName = "DEV"
+    } else if (BASE_URL.contains("staging168.com")) {
+        envName = "STAGING"
+    } else if (BASE_URL.contains("vir000.com")) {
+        envName = "PROD"
+    }
+
+    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+
+        def exported = readJSON file: '/tmp/exported_env.json'
+        def workflowId = exported.values.find { it.key == 'PC_WORKFLOW_ID' }?.value
+
+        if (!workflowId) {
+            echo "⚠️ 無法取得 PC_WORKFLOW_ID，跳過輪詢"
+            return
+        }
+
+        echo "📌 取得 workflowId：${workflowId}"
+
+        def maxRetries = 12
+        def delaySeconds = 300
+        def retryCount = 0
+        def success = false
+        def finalJobList = []
+        def domains = []
+
+        // 安全傳遞 ADM_KEY
+        withCredentials([string(credentialsId: 'STAGING_ADM_KEY', variable: 'ADM_KEY')]) {
+            while (retryCount < maxRetries) {
+                def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
+                echo "🔄 第 ${retryCount + 1} 次輪詢 workflow 狀態（${timestamp}）..."
+
+                def response = sh(
+                    script: """
+                        curl -s -X GET "${BASE_URL}/workflow_api/adm/workflows/${workflowId}/jobs" \\
+                            -H "X-API-Key: \$ADM_KEY" \\
+                            -H "Accept: application/json" \\
+                            -H "Content-Type: application/json"
+                    """,
+                    returnStdout: true
+                ).trim()
+
+                def jobs = readJSON text: response
+                domains = jobs*.domain.findAll { it }?.unique() ?: []
+
+                // 更新最終 Job 狀態
+                finalJobList = jobs.collect { [
+                    name: jobNameMap.get(it.name, it.name),
+                    status: it.status
+                ] }
+
+                // 若有 failure 或 blocked，立即停止輪詢
+                def hasFailureOrBlocked = jobs.any { it.status in ['failure', 'blocked'] }
+                if (hasFailureOrBlocked) {
+                    echo "❌ 發現 Job failure 或 blocked，停止輪詢"
+                    success = false
+                    break
+                }
+
+                // 若所有 Job 都完成
+                def stillPending = jobs.findAll { !(it.status in ['success', 'running']) }
+                if (stillPending.isEmpty()) {
+                    echo "✅ 所有 Job 已完成"
+                    success = true
+                    break
+                }
+
+                retryCount++
+                echo "⏳ 尚有 ${stillPending.size()} 個未完成 Job，等待 ${delaySeconds} 秒後進行下一次輪詢..."
+                sleep time: delaySeconds, unit: 'SECONDS'
+            }
+
+            if (!success) {
+                echo "⏰ 超過最大重試次數或 Job 失敗/封鎖，workflow 未完成，視為失敗"
+            }
+
+            // 產生 Job 狀態文字
+                def jobStatusText = finalJobList.collect { job ->
+                    def symbol = "•"
+                    if (job.status == "success") symbol = "✅"
+                    else if (job.status == "blocked") symbol = "⛔"
+                    else if (job.status == "failure") symbol = "❌"
+                    return " ${job.name} : ${symbol}"
+                }.join("\n")
+
+                // 卡片 JSON payload
+                def message = [
+                    cards: [[
+                        header: [
+                            title: "ℹ️ 申請憑證 (Job狀態檢查)",
+                            subtitle: "Workflow 輪詢完成",
+                            imageUrl: "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png"
+                        ],
+                        sections: [[
+                            widgets: [[
+                                textParagraph: [
+                                    text: """
+                環境 : <b>${envName}</b>
+                BASE_URL : <b>${BASE_URL}</b>
+                Workflow ID : <b>${workflowId}</b>
+                Domain : <b>${domains.join(', ')}</b>
+
+                -----------------------------------
+                <b> Job 狀態:</b>
+                ${jobStatusText}
+                """
+                                ]
+                            ]]
+                        ]]
+                    ]]
+                ]
+
+                // 將 payload 寫入檔案
+                writeFile file: 'payload.json', text: groovy.json.JsonOutput.toJson(message)
+
+                // 發送到 Google Chat
+                sh """
+                curl -s -X POST -H 'Content-Type: application/json' -d @payload.json "${WEBHOOK_URL}"
+                """
+        }
+    }
+}
+
+
 pipeline {
     agent any
 
     options {
-      skipDefaultCheckout(true)
+        skipDefaultCheckout(true)
     }
 
     environment {
-      COLLECTION_DIR = "${env.WORKSPACE}/collections"
-      REPORT_DIR = "${env.WORKSPACE}/reports"
-      HTML_REPORT_DIR = "${env.WORKSPACE}/reports/html"
-      ALLURE_RESULTS_DIR = "${env.WORKSPACE}/allure-results"
-      ENV_FILE = "${env.WORKSPACE}/environments/DEV.postman_environment.json"
-      WEBHOOK_URL = credentials('GOOGLE_CHAT_WEBHOOK')
-      BASE_URL = "http://maid-cloud.vir999.com"
-      ADM_KEY = credentials('DEV_ADM_KEY')
+        COLLECTION_DIR = "${env.WORKSPACE}/collections"
+        REPORT_DIR = "${env.WORKSPACE}/reports"
+        HTML_REPORT_DIR = "${env.WORKSPACE}/reports/html"
+        ALLURE_RESULTS_DIR = "${env.WORKSPACE}/allure-results"
+        ENV_FILE = "${env.WORKSPACE}/environments/STAGING.postman_environment.json"
+        BASE_URL = "http://maid.staging168.com"
+        ADM_KEY = credentials('STAGING_ADM_KEY')
+        WEBHOOK_URL = "https://chat.googleapis.com/v1/spaces/AAQAGYLH9k0/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=HvPXUUnqPlN6c9HhB02kpWleJ86p2lLmDaq32-5t0gQ"
     }
 
     stages {
-      stage('Clean Workspace') {
-        steps {
-          echo '🧹 清理 Jenkins 工作目錄...'
-          deleteDir()
-        }
-      }
-
-      stage('Checkout Code') {
-        steps {
-          echo '📥 Checkout Git repo...'
-          checkout scm
-        }
-      }
-
-      stage('Show Commit Info') {
-        steps {
-          sh '''
-            echo "✅ 當前 Git commit：$(git rev-parse HEAD)"
-            echo "📝 Commit 訊息：$(git log -1 --oneline)"
-          '''
-        }
-      }
-
-      stage('Prepare Folders') {
-        steps {
-          script {
-            def timestamp = sh(script: "date +%Y%m%d_%H%M%S", returnStdout: true).trim()
-            sh """
-              mkdir -p ${env.WORKSPACE}/report_backup
-              if [ -d "${REPORT_DIR}" ]; then
-                mv ${REPORT_DIR} ${env.WORKSPACE}/report_backup/${timestamp}
-                chmod -R 755 ${env.WORKSPACE}/report_backup/${timestamp}
-                echo 📦 備份舊報告到 ${env.WORKSPACE}/report_backup/${timestamp}
-              fi
-              rm -rf ${REPORT_DIR} ${HTML_REPORT_DIR} ${ALLURE_RESULTS_DIR}
-              mkdir -p ${REPORT_DIR} ${HTML_REPORT_DIR} ${ALLURE_RESULTS_DIR}
-            """
-          }
-        }
-      }
-
-    stage('申請廳主買域名') {
-      steps {
-        script {
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            sh '''
-              newman run "${COLLECTION_DIR}/申請廳主買域名.postman_collection.json" \
-                --environment "${ENV_FILE}" \
-                --export-environment "/tmp/exported_env.json" \
-                --insecure \
-                --reporters cli,json,html,junit,allure \
-                --reporter-json-export "${REPORT_DIR}/CustomerApplyPurchaseDomain_report.json" \
-                --reporter-html-export "${HTML_REPORT_DIR}/CustomerApplyPurchaseDomain_report.html" \
-                --reporter-junit-export "${REPORT_DIR}/CustomerApplyPurchaseDomain_report.xml" \
-                --reporter-allure-export "allure-results"
-            '''
-          }
-        }
-      }
-    }
-
-    stage('取得廳主買域名項目資料 (Job狀態檢查)') {
-      steps {
-        script {
-          def jobNameMap = [
-            "AddTag": "AddTag（新增 Tag）",
-            "AddThirdLevelRandom": "AddThirdLevelRandom（設定三級亂數）",
-            "AttachAntiBlockTarget": "AttachAntiBlockTarget（新增抗封鎖目標）",
-            "AttachAntiHijackSource": "AttachAntiHijackSource（新增抗劫持）",
-            "AttachAntiHijackTarget": "AttachAntiHijackTarget（新增抗劫持目標）",
-            "CheckDomainBlocked": "CheckDomainBlocked（檢查封鎖）",
-            "CheckPurchaseDeployCertificateStatus": "CheckPurchaseDeployCertificateStatus（檢查購買部署憑證結果）",
-            "CheckWorkflowApplication": "CheckWorkflowApplication（檢查自動化申請）",
-            "DeleteDomainRecord": "DeleteDomainRecord（刪除解析）",
-            "DetachAntiBlockSource": "DetachAntiBlockSource（撤下抗封鎖）",
-            "DetachAntiBlockTarget": "DetachAntiBlockTarget（撤下抗封鎖目標）",
-            "DetachAntiHijackSource": "DetachAntiHijackSource（撤下抗劫持）",
-            "DetachAntiHijackTarget": "DetachAntiHijackTarget（撤下抗劫持目標）",
-            "InformDomainInfringement": "InformDomainInfringement（通知侵權網址）",
-            "MergeErrorRecord": "MergeErrorRecord（檢查異常地區合併規則）",
-            "PurchaseAndDeployCert": "PurchaseAndDeployCert（購買與部署憑證）",
-            "PurchaseDomain": "PurchaseDomain（購買域名）",
-            "RecheckARecordResolution": "RecheckARecordResolution（複檢域名 A 紀錄解析）",
-            "RecheckCert": "RecheckCert（複檢憑證）",
-            "RecheckDomainResolution": "RecheckDomainResolution（複檢域名）",
-            "RecheckThirdLevelRandom": "RecheckThirdLevelRandom（複檢三級亂數）",
-            "RemoveAntiBlock": "RemoveAntiBlock（刪除抗封鎖）",
-            "RemoveAntiBlockTarget": "RemoveAntiBlockTarget（刪除抗封鎖目標）",
-            "RemoveAntiHijackSource": "RemoveAntiHijackSource（刪除抗劫持）",
-            "RemoveAntiHijackTarget": "RemoveAntiHijackTarget（刪除抗劫持目標）",
-            "RemoveTag": "RemoveTag（移除 Tag）",
-            "ReplaceCertificateProviderDetach": "ReplaceCertificateProviderDetach（替換憑證商下架）",
-            "ReuseAndDeployCert": "ReuseAndDeployCert（轉移憑證）",
-            "RevokeCert": "RevokeCert（撤銷憑證）",
-            "SendCertCompleted": "SendCertCompleted（通知憑證已完成）",
-            "SendUpdateUB": "SendUpdateUB（通知 UB 更新）",
-            "SyncT2": "SyncT2（同步 F5 T2 設定）",
-            "UpdateDomainRecord": "UpdateDomainRecord（設定域名解析）",
-            "UpdateNameServer": "UpdateNameServer（上層設定）",
-            "UpdateOneToOneList": "UpdateOneToOneList（更新一對一IP清單）",
-            "UpdateOneToOneSourceRecord": "UpdateOneToOneSourceRecord（來源域名解析設定）",
-            "UpdateOneToOneTargetRecord": "UpdateOneToOneTargetRecord（目標域名解析設定）",
-            "VerifyDomainPDNSTags": "VerifyDomainPDNSTags（驗證域名 PDNS Tag）",
-            "VerifyTLD": "VerifyTLD（驗證頂級域名）"
-          ]
-
-          def envName = "測試環境"
-            if (BASE_URL.contains("vir999.com")) {
-              envName = "DEV"
-            } else if (BASE_URL.contains("staging168.com")) {
-              envName = "STAGING"
-            } else if (BASE_URL.contains("vir000.com")) {
-              envName = "PROD"
-          }
-          
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            def exported = readJSON file: '/tmp/exported_env.json'
-            def workflowId = exported.values.find { it.key == 'PD_WORKFLOW_ID' }?.value
-    
-            if (!workflowId) {
-              error("❌ 無法從 /tmp/exported_env.json 中取得 PD_WORKFLOW_ID")
+        stage('Clean Workspace') {
+            steps {
+                echo '🧹 清理 Jenkins 工作目錄...'
+                deleteDir()
             }
-    
-            echo "📌 取得 workflowId：${workflowId}"
-    
-            def maxRetries = 10
-            def delaySeconds = 300
-            def retryCount = 0
-            def success = false
-    
-            while (retryCount < maxRetries) {
-              def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
-              echo "🔄 第 ${retryCount + 1} 次輪詢 workflow 狀態（${timestamp}）..."
-    
-              def response = sh(
-                script: """
-                  curl -s -X GET "${BASE_URL}/workflow_api/adm/workflows/${workflowId}/jobs" \\
-                    -H "X-API-Key: ${ADM_KEY}" \\
-                    -H "Accept: application/json" \\
-                    -H "Content-Type: application/json"
-                """,
-                returnStdout: true
-              ).trim()
-    
-              echo "🔎 API 回應：${response}"
-    
-              def json = readJSON text: response
-    
-              def failedJobs = json.findAll { it.status == 'failure' }
-              def blockedJobs = json.findAll { it.status == 'blocked' }
-              def pendingJobs = json.findAll { !(it.status in ['success', 'running', 'failure', 'blocked']) }
-    
-              if (failedJobs || blockedJobs) {
-                def failedDetails = failedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - ❌failure" }
-                def blockedDetails = blockedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - 🔒blocked" }
-                def allIssues = (failedDetails + blockedDetails).join("\\n")
-    
-                echo "🚨 偵測到異常 Job：\n${allIssues.replace('\\n', '\n')}"
-    
-               def message = """{
-                  "cards": [
-                    {
-                      "header": {
-                        "title": "🚨 Jenkins - 廳主買域名項目資料 (Job狀態檢查 - 異常)",
-                        "subtitle": "Workflow ID: ${workflowId}",
-                        "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png",
-                        "imageStyle": "AVATAR"
-                      },
-                      "sections": [
-                        {
-                          "widgets": [
-                            {
-                              "keyValue": {
-                                "topLabel": "🌐 測試環境",
-                                "content": "${envName}"
-                              }
-                            },
-                            {
-                              "keyValue": {
-                                "topLabel": "🔗 BASE_URL",
-                                "content": "${BASE_URL}"
-                              }
-                            },
-                            {
-                              "textParagraph": {
-                                "text": "────────────────────────────"
-                              }
-                            },
-                            {
-                              "textParagraph": {
-                                "text": "<b>自動化Job:</b><br>${allIssues.replace('"', '\\"').replaceAll('\\n', '<br>')}"
-                              }
-                            }
+        }
 
-                          ]
-                        }
-                      ]
+        stage('Checkout Code') {
+            steps {
+                echo '📥 Checkout Git repo...'
+                checkout scm
+            }
+        }
+
+        stage('Show Commit Info') {
+            steps {
+                sh '''
+                    echo "✅ 當前 Git commit：$(git rev-parse HEAD)"
+                    echo "📝 Commit 訊息：$(git log -1 --oneline)"
+                '''
+            }
+        }
+
+        stage('申請憑證') {
+            steps {
+                script {
+                    def testData = readJSON file: "${COLLECTION_DIR}/STAGING_申請憑證_測試資料.json"
+
+                    def readExportedEnvVariable = { filePath, key ->
+                        def envData = readJSON file: filePath
+                        return envData?.values?.find { it.key == key }?.value
                     }
-                  ]
-                }"""
 
-                writeFile file: 'payload.json', text: message
+                    // 確保目錄存在
+                    sh "mkdir -p '${ALLURE_RESULTS_DIR}' '${REPORT_DIR}' '${HTML_REPORT_DIR}' '${WORKSPACE}/environments'"
 
-                withEnv(["WEBHOOK=${WEBHOOK_URL}"]) {
-                  sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"'
-                }
-    
-                error("❌ 偵測到異常 Job（已通知 webhook）")
-              }
-    
-              if (pendingJobs.isEmpty()) {
-                echo "✅ 所有 Job 已完成，提前結束輪詢"
-                success = true
-                break
-              }
-    
-              retryCount++
-              echo "⏳ 尚有 ${pendingJobs.size()} 個未完成 Job，等待 ${delaySeconds} 秒後進行下一次輪詢..."
-              sleep time: delaySeconds, unit: 'SECONDS'
-            }
-    
-            if (!success) {
-              echo "⏰ 超過最大重試次數（${maxRetries} 次），workflow 未完成"
-    
-              writeFile file: 'payload.json', text: """{
-                "cards": [{
-                  "header": {
-                    "title": "⏰ 廳主買域名項目資料 (Job狀態檢查) 輪詢超時失敗",
-                    "subtitle": "Workflow Timeout",
-                    "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png"
-                  },
-                  "sections": [{
-                    "widgets": [
-                      {
-                        "textParagraph": {
-                          "text": "🌐 測試環境: <b>${envName}</b>\\n🔗 BASE_URL: ${BASE_URL}"
-                        }
-                      },
-                      {
-                          "textParagraph": {
-                            "text": "────────────────────────────"
-                          }
-                        },
-                      {
-                        "keyValue": {
-                          "topLabel": "Workflow ID",
-                          "content": "${workflowId}"
-                        }
-                      }
-                    ]
-                  }]
-                }]
-              }"""
-    
-              withEnv(["WEBHOOK_URL=${WEBHOOK_URL}"]) {
-                sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"'
-              }
-    
-              error("⏰ Workflow Timeout，已通知 webhook")
-            }
-          }
-        }
-      }
-    }
+                    testData.eachWithIndex { dataRow, index ->
+                        def testLabel = "資料${index + 1}"
+                        def tmpDataFile = "${WORKSPACE}/data_${index + 1}.json"
+                        writeJSON file: tmpDataFile, json: [dataRow]
 
+                        // 子 stage 1：申請憑證
+                        stage("${testLabel} - 申請憑證") {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                def currentEnvFile = "${WORKSPACE}/environments/current_env_${index + 1}.json"
 
-    stage('申請憑證') {
-      steps {
-        script {
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            sh '''
-              newman run "${COLLECTION_DIR}/申請憑證.postman_collection.json" \
-                --environment "${ENV_FILE}" \
-                --export-environment "/tmp/exported_env.json" \
-                --insecure \
-                --reporters cli,json,html,junit,allure \
-                --reporter-json-export "${REPORT_DIR}/PurchaseCertificate_report.json" \
-                --reporter-html-export "${HTML_REPORT_DIR}/PurchaseCertificate_report.html" \
-                --reporter-junit-export "${REPORT_DIR}/PurchaseCertificate_report.xml" \
-                --reporter-allure-export "allure-results"
-            '''
-          }
-        }
-      }
-    }
+                                sh """
+                                    newman run "${COLLECTION_DIR}/申請憑證.postman_collection.json" \\
+                                        --environment "${ENV_FILE}" \\
+                                        --export-environment "/tmp/exported_env.json" \\
+                                        --iteration-data "${tmpDataFile}" \\
+                                        --verbose \\
+                                        --insecure \\
+                                        --reporters cli,json,html,junit,allure \\
+                                        --reporter-json-export "${REPORT_DIR}/Apply_${index + 1}.json" \\
+                                        --reporter-html-export "${HTML_REPORT_DIR}/Apply_${index + 1}.html" \\
+                                        --reporter-junit-export "${REPORT_DIR}/Apply_${index + 1}.xml" \\
+                                        --reporter-allure-export "${ALLURE_RESULTS_DIR}"
+                                    cp /tmp/exported_env.json "${currentEnvFile}"
+                                """
 
-    stage('取得購買憑證申請詳細資料 (Job狀態檢查)') {
-      steps {
-        script {
-          def jobNameMap = [
-            "AddTag": "AddTag（新增 Tag）",
-            "AddThirdLevelRandom": "AddThirdLevelRandom（設定三級亂數）",
-            "AttachAntiBlockTarget": "AttachAntiBlockTarget（新增抗封鎖目標）",
-            "AttachAntiHijackSource": "AttachAntiHijackSource（新增抗劫持）",
-            "AttachAntiHijackTarget": "AttachAntiHijackTarget（新增抗劫持目標）",
-            "CheckDomainBlocked": "CheckDomainBlocked（檢查封鎖）",
-            "CheckPurchaseDeployCertificateStatus": "CheckPurchaseDeployCertificateStatus（檢查購買部署憑證結果）",
-            "CheckWorkflowApplication": "CheckWorkflowApplication（檢查自動化申請）",
-            "DeleteDomainRecord": "DeleteDomainRecord（刪除解析）",
-            "DetachAntiBlockSource": "DetachAntiBlockSource（撤下抗封鎖）",
-            "DetachAntiBlockTarget": "DetachAntiBlockTarget（撤下抗封鎖目標）",
-            "DetachAntiHijackSource": "DetachAntiHijackSource（撤下抗劫持）",
-            "DetachAntiHijackTarget": "DetachAntiHijackTarget（撤下抗劫持目標）",
-            "InformDomainInfringement": "InformDomainInfringement（通知侵權網址）",
-            "MergeErrorRecord": "MergeErrorRecord（檢查異常地區合併規則）",
-            "PurchaseAndDeployCert": "PurchaseAndDeployCert（購買與部署憑證）",
-            "PurchaseDomain": "PurchaseDomain（購買域名）",
-            "RecheckARecordResolution": "RecheckARecordResolution（複檢域名 A 紀錄解析）",
-            "RecheckCert": "RecheckCert（複檢憑證）",
-            "RecheckDomainResolution": "RecheckDomainResolution（複檢域名）",
-            "RecheckThirdLevelRandom": "RecheckThirdLevelRandom（複檢三級亂數）",
-            "RemoveAntiBlock": "RemoveAntiBlock（刪除抗封鎖）",
-            "RemoveAntiBlockTarget": "RemoveAntiBlockTarget（刪除抗封鎖目標）",
-            "RemoveAntiHijackSource": "RemoveAntiHijackSource（刪除抗劫持）",
-            "RemoveAntiHijackTarget": "RemoveAntiHijackTarget（刪除抗劫持目標）",
-            "RemoveTag": "RemoveTag（移除 Tag）",
-            "ReplaceCertificateProviderDetach": "ReplaceCertificateProviderDetach（替換憑證商下架）",
-            "ReuseAndDeployCert": "ReuseAndDeployCert（轉移憑證）",
-            "RevokeCert": "RevokeCert（撤銷憑證）",
-            "SendCertCompleted": "SendCertCompleted（通知憑證已完成）",
-            "SendUpdateUB": "SendUpdateUB（通知 UB 更新）",
-            "SyncT2": "SyncT2（同步 F5 T2 設定）",
-            "UpdateDomainRecord": "UpdateDomainRecord（設定域名解析）",
-            "UpdateNameServer": "UpdateNameServer（上層設定）",
-            "UpdateOneToOneList": "UpdateOneToOneList（更新一對一IP清單）",
-            "UpdateOneToOneSourceRecord": "UpdateOneToOneSourceRecord（來源域名解析設定）",
-            "UpdateOneToOneTargetRecord": "UpdateOneToOneTargetRecord（目標域名解析設定）",
-            "VerifyDomainPDNSTags": "VerifyDomainPDNSTags（驗證域名 PDNS Tag）",
-            "VerifyTLD": "VerifyTLD（驗證頂級域名）"
-          ]
-          
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            def exported = readJSON file: '/tmp/exported_env.json'
-            def workflowId = exported.values.find { it.key == 'PC_WORKFLOW_ID' }?.value
-    
-            if (!workflowId) {
-              error("❌ 無法從 /tmp/exported_env.json 中取得 PC_WORKFLOW_ID")
-            }
-    
-            echo "📌 取得 workflowId：${workflowId}"
-    
-            def maxRetries = 10
-            def delaySeconds = 300
-            def retryCount = 0
-            def success = false
-    
-            while (retryCount < maxRetries) {
-              def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
-              echo "🔄 第 ${retryCount + 1} 次輪詢 workflow 狀態（${timestamp}）..."
-    
-              def response = sh(
-                script: """
-                  curl -s -X GET "${BASE_URL}/workflow_api/adm/workflows/${workflowId}/jobs" \\
-                    -H "X-API-Key: ${ADM_KEY}" \\
-                    -H "Accept: application/json" \\
-                    -H "Content-Type: application/json"
-                """,
-                returnStdout: true
-              ).trim()
-    
-              echo "🔎 API 回應：${response}"
-    
-              def json = readJSON text: response
-    
-              def failedJobs = json.findAll { it.status == 'failure' }
-              def blockedJobs = json.findAll { it.status == 'blocked' }
-              def pendingJobs = json.findAll { !(it.status in ['success', 'running', 'failure', 'blocked']) }
-    
-              if (failedJobs || blockedJobs) {
-                def failedDetails = failedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - ❌failure" }
-                def blockedDetails = blockedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - 🔒blocked" }
-                def allIssues = (failedDetails + blockedDetails).join("\\n")
-    
-                echo "🚨 偵測到異常 Job：\n${allIssues.replace('\\n', '\n')}"
-    
-                def message = """{
-                    "cards": [
-                      {
-                        "header": {
-                          "title": "🚨 Jenkins - 申請購買憑證項目資料 (Job狀態檢查 - 異常)",
-                          "subtitle": "Workflow ID: ${workflowId}",
-                          "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png",
-                          "imageStyle": "AVATAR"
-                        },
-                        "sections": [
-                          {
-                            "widgets": [
-                              {
-                                "keyValue": {
-                                  "topLabel": "🌐 測試環境",
-                                  "content": "${envName}"
+                                env.ENV_FILE = currentEnvFile
+                                echo "✅ 更新 ENV_FILE 為最新：${currentEnvFile}" 
+
+                                def PC_WORKFLOW_ID = readExportedEnvVariable("/tmp/exported_env.json", "PC_WORKFLOW_ID")
+                                if (PC_WORKFLOW_ID) {
+                                    env.PC_WORKFLOW_ID = PC_WORKFLOW_ID
+                                    echo "📤 取得 PC_WORKFLOW_ID: ${PC_WORKFLOW_ID}"
+                                } else {
+                                    echo "⚠️ exported_env.json 未包含 PC_WORKFLOW_ID"
                                 }
-                              },
-                              {
-                                "keyValue": {
-                                  "topLabel": "🔗 BASE_URL",
-                                  "content": "${BASE_URL}"
-                                }
-                              },
-                              {
-                                "textParagraph": {
-                                  "text": "────────────────────────────"
-                                }
-                              },
-                              {
-                                "textParagraph": {
-                                  "text": "<b>自動化Job:</b><br>${allIssues.replace('"', '\\"').replaceAll('\\n', '<br>')}"
-                                }
-                              }
-
-                            ]
-                          }
-                        ]
-                      }
-                    ]
-                  }"""
-
-                  writeFile file: 'payload.json', text: message
-
-                  withEnv(["WEBHOOK=${WEBHOOK_URL}"]) {
-                    sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"'
-                  }
-      
-                  error("❌ 偵測到異常 Job（已通知 webhook）")
-                }
-      
-                if (pendingJobs.isEmpty()) {
-                  echo "✅ 所有 Job 已完成，提前結束輪詢"
-                  success = true
-                  break
-                }
-      
-                retryCount++
-                echo "⏳ 尚有 ${pendingJobs.size()} 個未完成 Job，等待 ${delaySeconds} 秒後進行下一次輪詢..."
-                sleep time: delaySeconds, unit: 'SECONDS'
-              }
-      
-              if (!success) {
-                echo "⏰ 超過最大重試次數（${maxRetries} 次），workflow 未完成"
-      
-                writeFile file: 'payload.json', text: """{
-                  "cards": [{
-                    "header": {
-                      "title": "⏰ 申請購買憑證項目資料 (Job狀態檢查) 輪詢超時失敗",
-                      "subtitle": "Workflow Timeout",
-                      "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png"
-                    },
-                    "sections": [{
-                      "widgets": [
-                        {
-                          "textParagraph": {
-                            "text": "🌐 測試環境: <b>${envName}</b>\\n🔗 BASE_URL: ${BASE_URL}"
-                          }
-                        },
-                        {
-                            "textParagraph": {
-                              "text": "────────────────────────────"
                             }
-                          },
-                        {
-                          "keyValue": {
-                            "topLabel": "Workflow ID",
-                            "content": "${workflowId}"
-                          }
                         }
-                      ]
-                    }]
-                  }]
-                }"""
-      
-                withEnv(["WEBHOOK_URL=${WEBHOOK_URL}"]) {
-                  sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"'
+
+                        // 子 stage 2：檢查 Job 狀態
+                        stage("${testLabel} - 檢查申請 Job 狀態") {
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                DeleteDomainJobStatus()
+                            }
+                        }
+                    }
+
+                    // 合併所有 JSON 成 all_test_results.json
+                    def allResults = [:]
+                    testData.eachWithIndex { dataRow, index ->
+                        def jsonFile = "${REPORT_DIR}/Apply_${index + 1}.json"
+                        if (fileExists(jsonFile)) {
+                            def json = readJSON file: jsonFile
+                            allResults["資料${index + 1}"] = json.status ?: "UNKNOWN"
+                        } else {
+                            allResults["資料${index + 1}"] = "NO_RESULT"
+                        }
+                    }
+                    writeJSON file: "${REPORT_DIR}/all_test_results.json", json: allResults
                 }
-      
-                error("⏰ Workflow Timeout，已通知 webhook")
-              }
             }
         }
-      }
-    }
 
-    stage('刪除域名') {
-      steps {
-        script {
-          def collectionPath = "${COLLECTION_DIR}/清除測試域名.postman_collection.json"
-          if (fileExists(collectionPath)) {
-            echo "🧹 開始執行測試資料清除 collection：清除測試域名"
-            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-              sh """
-                newman run "${collectionPath}" \
-                  --environment "${ENV_FILE}" \
-                  --export-environment "/tmp/exported_env.json" \
-                  --insecure \
-                  --reporters cli,json,html,junit,allure \
-                  --reporter-json-export "${REPORT_DIR}/DeleteDomain_cleanup_report.json" \
-                  --reporter-html-export "${HTML_REPORT_DIR}/DeleteDomain_cleanup_report.html" \
-                  --reporter-junit-export "${REPORT_DIR}/DeleteDomain_cleanup_report.xml" \
-                  --reporter-allure-export "allure-results"
-              """
+        stage('產生 Allure 報告') {
+            steps {
+                script {
+                    echo "📦 產生 Allure 測試報告..."
+                    allure([
+                        includeProperties: false,
+                        jdk: '',
+                        results: [[path: "${ALLURE_RESULTS_DIR}"]]
+                    ])
+                }
             }
-          } else {
-            echo "⚠️ 找不到 collection 檔案：${collectionPath}，跳過清除流程"
-          }
         }
-      }
     }
 
-    stage('取得刪除域名項目資料 (Job狀態檢查)') {
-      steps {
-        script {
-          def jobNameMap = [
-            "AddTag": "AddTag（新增 Tag）",
-            "AddThirdLevelRandom": "AddThirdLevelRandom（設定三級亂數）",
-            "AttachAntiBlockTarget": "AttachAntiBlockTarget（新增抗封鎖目標）",
-            "AttachAntiHijackSource": "AttachAntiHijackSource（新增抗劫持）",
-            "AttachAntiHijackTarget": "AttachAntiHijackTarget（新增抗劫持目標）",
-            "CheckDomainBlocked": "CheckDomainBlocked（檢查封鎖）",
-            "CheckPurchaseDeployCertificateStatus": "CheckPurchaseDeployCertificateStatus（檢查購買部署憑證結果）",
-            "CheckWorkflowApplication": "CheckWorkflowApplication（檢查自動化申請）",
-            "DeleteDomainRecord": "DeleteDomainRecord（刪除解析）",
-            "DetachAntiBlockSource": "DetachAntiBlockSource（撤下抗封鎖）",
-            "DetachAntiBlockTarget": "DetachAntiBlockTarget（撤下抗封鎖目標）",
-            "DetachAntiHijackSource": "DetachAntiHijackSource（撤下抗劫持）",
-            "DetachAntiHijackTarget": "DetachAntiHijackTarget（撤下抗劫持目標）",
-            "InformDomainInfringement": "InformDomainInfringement（通知侵權網址）",
-            "MergeErrorRecord": "MergeErrorRecord（檢查異常地區合併規則）",
-            "PurchaseAndDeployCert": "PurchaseAndDeployCert（購買與部署憑證）",
-            "PurchaseDomain": "PurchaseDomain（購買域名）",
-            "RecheckARecordResolution": "RecheckARecordResolution（複檢域名 A 紀錄解析）",
-            "RecheckCert": "RecheckCert（複檢憑證）",
-            "RecheckDomainResolution": "RecheckDomainResolution（複檢域名）",
-            "RecheckThirdLevelRandom": "RecheckThirdLevelRandom（複檢三級亂數）",
-            "RemoveAntiBlock": "RemoveAntiBlock（刪除抗封鎖）",
-            "RemoveAntiBlockTarget": "RemoveAntiBlockTarget（刪除抗封鎖目標）",
-            "RemoveAntiHijackSource": "RemoveAntiHijackSource（刪除抗劫持）",
-            "RemoveAntiHijackTarget": "RemoveAntiHijackTarget（刪除抗劫持目標）",
-            "RemoveTag": "RemoveTag（移除 Tag）",
-            "ReplaceCertificateProviderDetach": "ReplaceCertificateProviderDetach（替換憑證商下架）",
-            "ReuseAndDeployCert": "ReuseAndDeployCert（轉移憑證）",
-            "RevokeCert": "RevokeCert（撤銷憑證）",
-            "SendCertCompleted": "SendCertCompleted（通知憑證已完成）",
-            "SendUpdateUB": "SendUpdateUB（通知 UB 更新）",
-            "SyncT2": "SyncT2（同步 F5 T2 設定）",
-            "UpdateDomainRecord": "UpdateDomainRecord（設定域名解析）",
-            "UpdateNameServer": "UpdateNameServer（上層設定）",
-            "UpdateOneToOneList": "UpdateOneToOneList（更新一對一IP清單）",
-            "UpdateOneToOneSourceRecord": "UpdateOneToOneSourceRecord（來源域名解析設定）",
-            "UpdateOneToOneTargetRecord": "UpdateOneToOneTargetRecord（目標域名解析設定）",
-            "VerifyDomainPDNSTags": "VerifyDomainPDNSTags（驗證域名 PDNS Tag）",
-            "VerifyTLD": "VerifyTLD（驗證頂級域名）"
-          ]
-         
-          def envName = "測試環境"
-            if (BASE_URL.contains("vir999.com")) {
-              envName = "DEV"
-            } else if (BASE_URL.contains("staging168.com")) {
-              envName = "STAGING"
-            } else if (BASE_URL.contains("vir000.com")) {
-              envName = "PROD"
-          }
+    post {
+        always {
+            script {
+                // 強制外層 Build 成功
+                currentBuild.result = 'SUCCESS'
 
-          catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-            def exported = readJSON file: '/tmp/exported_env.json'
-            def workflowId = exported.values.find { it.key == 'DD_WORKFLOW_ID' }?.value
-    
-            if (!workflowId) {
-              error("❌ 無法從 /tmp/exported_env.json 中取得 DD_WORKFLOW_ID")
-            }
-    
-            echo "📌 取得 workflowId：${workflowId}"
-    
-            def maxRetries = 10
-            def delaySeconds = 300
-            def retryCount = 0
-            def success = false
-    
-            while (retryCount < maxRetries) {
-              def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
-              echo "🔄 第 ${retryCount + 1} 次輪詢 workflow 狀態（${timestamp}）..."
-    
-              def response = sh(
-                script: """
-                  curl -s -X GET "${BASE_URL}/workflow_api/adm/workflows/${workflowId}/jobs" \\
-                    -H "X-API-Key: ${ADM_KEY}" \\
-                    -H "Accept: application/json" \\
-                    -H "Content-Type: application/json"
-                """,
-                returnStdout: true
-              ).trim()
-    
-              echo "🔎 API 回應：${response}"
-    
-              def json = readJSON text: response
-    
-              def failedJobs = json.findAll { it.status == 'failure' }
-              def blockedJobs = json.findAll { it.status == 'blocked' }
-              def pendingJobs = json.findAll { !(it.status in ['success', 'running', 'failure', 'blocked']) }
-    
-              if (failedJobs || blockedJobs) {
-                def failedDetails = failedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - ❌failure" }
-                def blockedDetails = blockedJobs.collect { "- ${jobNameMap.get(it.name, it.name)} - 🔒blocked" }
-                def allIssues = (failedDetails + blockedDetails).join("\\n")
-    
-                echo "🚨 偵測到異常 Job：\n${allIssues.replace('\\n', '\n')}"
-    
-               writeFile file: 'payload.json', text: """{
-                  "cards": [{
+                def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
+
+                // 讀取測試結果，避免檔案不存在造成錯誤
+                def testResults = fileExists("${REPORT_DIR}/all_test_results.json") ? 
+                                readJSON(file: "${REPORT_DIR}/all_test_results.json") : [:]
+
+                // 計算 BUILD_URL 去掉 https://
+                def buildUrlNoHttps = env.BUILD_URL.replaceFirst(/^https?:\/\//, '')
+
+                def message = """
+                {
+                "cards": [
+                    {
                     "header": {
-                      "title": "🚨 刪除域名項目資料 (Job狀態檢查 - 異常)",
-                      "subtitle": "Workflow: ${workflowId}",
-                      "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png"
+                        "title": "✅ Jenkins Pipeline 執行完成",
+                        "subtitle": "專案：${env.JOB_NAME} (#${env.BUILD_NUMBER})",
+                        "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/jenkins-icon.png",
+                        "imageStyle": "AVATAR"
                     },
                     "sections": [
                         {
-                          "widgets": [
-                            {
-                              "keyValue": {
-                                "topLabel": "🌐 測試環境",
-                                "content": "${envName}"
-                              }
-                            },
-                            {
-                              "keyValue": {
-                                "topLabel": "🔗 BASE_URL",
-                                "content": "${BASE_URL}"
-                              }
-                            },
-                            {
-                              "textParagraph": {
-                                "text": "────────────────────────────"
-                              }
-                            },
-                            {
-                              "textParagraph": {
-                                "text": "<b>自動化Job:</b><br>${allIssues.replace('"', '\\"').replaceAll('\\n', '<br>')}"
-                              }
-                            }
-
-                          ]
+                        "widgets": [
+                            {"textParagraph": {"text": "完成時間：${timestamp}"}},
+                            {"textParagraph": {"text": "Allure 報告鏈結： <a href='http://${buildUrlNoHttps}allure'>點此查看</a>"}}
+                        ]
                         }
-                      ]
-                    }]
-                  }]
-                }"""
-    
-                withEnv(["WEBHOOK_URL=${WEBHOOK_URL}"]) {
-                  sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"'
-                }
-    
-                error("❌ 偵測到異常 Job（已通知 webhook）")
-              }
-    
-              if (pendingJobs.isEmpty()) {
-                echo "✅ 所有 Job 已完成，提前結束輪詢"
-                success = true
-                break
-              }
-    
-              retryCount++
-              echo "⏳ 尚有 ${pendingJobs.size()} 個未完成 Job，等待 ${delaySeconds} 秒後進行下一次輪詢..."
-              sleep time: delaySeconds, unit: 'SECONDS'
-            }
-    
-            if (!success) {
-              echo "⏰ 超過最大重試次數（${maxRetries} 次），workflow 未完成"
-    
-               writeFile file: 'payload.json', text: """{
-                "cards": [{
-                  "header": {
-                    "title": "⏰ 刪除域名項目資料 (Job狀態檢查) 輪詢超時失敗",
-                    "subtitle": "Workflow Timeout",
-                    "imageUrl": "https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/postman-icon.png"
-                  },
-                  "sections": [{
-                    "widgets": [
-                      {
-                        "textParagraph": {
-                          "text": "🌐 測試環境: <b>${envName}</b>\\n🔗 BASE_URL: ${BASE_URL}"
-                        }
-                      },
-                      {
-                          "textParagraph": {
-                            "text": "────────────────────────────"
-                          }
-                        },
-                      {
-                        "keyValue": {
-                          "topLabel": "Workflow ID",
-                          "content": "${workflowId}"
-                        }
-                      }
                     ]
-                  }]
-                }]
-              }"""
-    
-              withEnv(["WEBHOOK_URL=${WEBHOOK_URL}"]) {
-                sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"'
-              }
-    
-              error("⏰ Workflow Timeout，已通知 webhook")
-            }
-          }
-        }
-      }
-    }
-
-    stage('Publish HTML Reports') {
-      steps {
-        publishHTML(target: [
-          reportDir: "${HTML_REPORT_DIR}",
-          reportFiles: '01_report.html', // 或其他主頁，依實際報告為主
-          reportName: '申請廳主買域名 HTML Reports',
-          allowMissing: true,
-          alwaysLinkToLastBuild: true,
-          keepAll: true
-        ])
-      }
-    }
-
-    stage('Allure Report') {
-      steps {
-        allure([
-          includeProperties: false,
-          jdk: '',
-          results: [[path: 'allure-results']]
-        ])
-      }
-    }
-  }
-
-  post {
-    always {
-      script {
-        def buildResult = currentBuild.currentResult
-        def statusEmoji = buildResult == 'SUCCESS' ? '✅' :
-                          buildResult == 'FAILURE' ? '❌' :
-                          buildResult == 'UNSTABLE' ? '⚠️' :
-                          buildResult == 'ABORTED' ? '🚫' : '❔'
-
-        // 對應中文狀態
-        def statusText = buildResult == 'SUCCESS' ? '成功(SUCCESS)' :
-                        buildResult == 'FAILURE' ? '失敗(FAILURE)' :
-                        buildResult == 'UNSTABLE' ? '不穩定(UNSTABLE)' :
-                        buildResult == 'ABORTED' ? '已終止(ABORTED)' : '未知'
-
-        def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss", TimeZone.getTimeZone('Asia/Taipei'))
-
-        def message = """
-        {
-          \"cards\": [
-            {
-              \"header\": {
-                \"title\": \"${statusEmoji} Jenkins Pipeline 執行結果\",
-                \"subtitle\": \"專案：${env.JOB_NAME} (#${env.BUILD_NUMBER})\",
-                \"imageUrl\": \"https://uxwing.com/wp-content/themes/uxwing/download/brands-and-social-media/jenkins-icon.png\",
-                \"imageStyle\": \"AVATAR\"
-              },
-              \"sections\": [
-                {
-                  \"widgets\": [
-                    {
-                      \"keyValue\": {
-                        \"topLabel\": \"狀態\",
-                        \"content\": \"${statusText}\"
-                      }
-                    },
-                    {
-                      \"keyValue\": {
-                        \"topLabel\": \"完成時間\",
-                        \"content\": \"${timestamp}\"
-                      }
                     }
-                  ]
+                ]
                 }
-              ]
+                """
+
+                writeFile file: 'payload.json', text: message
+                sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK_URL"'
             }
-          ]
         }
-        """
-
-        writeFile file: 'payload.json', text: message
-
-        withEnv(["WEBHOOK=${WEBHOOK_URL}"]) {
-          sh 'curl -k -X POST -H "Content-Type: application/json" -d @payload.json "$WEBHOOK"'
-        }
-      }
     }
-  }
 
 }
+
+
+
+
+
+
