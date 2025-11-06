@@ -1,5 +1,5 @@
-// 取得刪除域名項目資料 (輪詢Job狀態檢查)
-def DeleteDomainJobStatus() {
+// 取得申請憑證項目資料 (輪詢Job狀態檢查)
+def PurchaseCertificateJobStatus() {
     def jobNameMap = [
         "AddTag": "AddTag 新增 Tag",
         "AddThirdLevelRandom": "AddThirdLevelRandom 設定三級亂數",
@@ -264,7 +264,7 @@ pipeline {
                         // 子 stage 2：檢查 Job 狀態
                         stage("${testLabel} - 檢查申請 Job 狀態") {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                DeleteDomainJobStatus()
+                                PurchaseCertificateJobStatus()
                             }
                         }
                     }
